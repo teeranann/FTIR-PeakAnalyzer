@@ -1,23 +1,70 @@
+"""
+FTIR Peak Analyzer
+==================
+
+Interactive Tk desktop tool for analysing FTIR (Fourier-Transform Infrared)
+spectra. Paste a two-column spectrum, detect peaks, fit overlapping bands
+with a multi-Lorentzian model, and read off the band assignments, heights,
+widths, and integrated areas.
+
+Pipeline (matches the on-screen ribbon, sections 1 → 6):
+    1. DATA & AXIS         paste / transform / clip the spectrum
+    2. VISUAL CONTROL      font sizes, label spacing
+    3. PEAK DETECTION      auto + manual peak picking
+    4. MODEL & FIT         initial Lorentzian guesses → curve_fit
+    5. VISUALIZATION GRAPH live matplotlib canvas
+    6. RESULTS TABLE       fitted peaks with chemical assignments
+
+Author
+------
+Teeranan Nongnual
+Department of Chemistry, Faculty of Science, Burapha University, Thailand
+
+Funding
+-------
+Burapha University (BUU) and Thailand Science Research and Innovation (TSRI).
+
+License
+-------
+Non-commercial use license — free to use, study, modify, and redistribute
+for academic / educational / non-commercial purposes. Commercial use
+requires written permission. See the LICENSE file.
+"""
+
+# =====================================================================
+# IMPORTS
+# =====================================================================
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, filedialog
 import numpy as np
-from scipy.signal import find_peaks
-from scipy.optimize import curve_fit
+from scipy.signal import find_peaks          # automatic peak picking
+from scipy.optimize import curve_fit         # non-linear least squares
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 import copy
 import random
-from io import BytesIO
-from PIL import Image
-import ctypes
+from io import BytesIO                       # in-memory PNG/BMP buffers
+from PIL import Image                        # PNG → BMP conversion for clipboard
+import ctypes                                # Win32 API access
 from ctypes import wintypes
 
-# --- 1. ENABLE HIGH DPI ---
+# ---------------------------------------------------------------------
+# 1. ENABLE HIGH-DPI AWARENESS (Windows only)
+# ---------------------------------------------------------------------
+# Without this, Tk renders blurry on >100% display scaling. The call is
+# wrapped in try/except so the same script still runs on non-Windows
+# systems or older Windows versions that lack `SetProcessDpiAwareness`.
 try: ctypes.windll.shcore.SetProcessDpiAwareness(1)
 except: pass
 
-# --- 2. SAFE CLIPBOARD SETUP ---
+# ---------------------------------------------------------------------
+# 2. WIN32 CLIPBOARD SETUP (used by "Copy graph to clipboard")
+# ---------------------------------------------------------------------
+# Tk's built-in clipboard only handles text. To put a *bitmap* on the
+# clipboard (so it can be pasted into Word, PowerPoint, ChemDraw, ...),
+# we go directly to the Win32 user32 / kernel32 APIs and use the
+# CF_DIB (device-independent bitmap) clipboard format.
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
 user32.OpenClipboard.argtypes = [ctypes.c_void_p]
@@ -30,18 +77,55 @@ kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
 kernel32.GlobalLock.restype = ctypes.c_void_p
 kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
 kernel32.GlobalSize.argtypes = [ctypes.c_void_p]
-CF_DIB = 8; GMEM_MOVEABLE = 0x0002
+CF_DIB = 8                # clipboard format: device-independent bitmap
+GMEM_MOVEABLE = 0x0002    # GlobalAlloc flag required for clipboard data
 
-# --- Physics / Math (Logic UNCHANGED) ---
+# =====================================================================
+# PHYSICS / MATH  — peak shape model
+# =====================================================================
+# IR absorption bands are well approximated by Lorentzian line shapes
+# (homogeneous broadening). A full spectrum is treated as a *sum* of
+# such Lorentzians, one per chemical mode. The fit parameters are
+# triples (amplitude, centre, width) — 3 numbers per peak.
+# ---------------------------------------------------------------------
+
 def lorentzian(x, amp, cen, wid):
+    """Single Lorentzian line shape.
+
+    f(x) = amp * wid² / ((x − cen)² + wid²)
+
+    Parameters
+    ----------
+    x    : array of wavenumbers (cm⁻¹)
+    amp  : peak height at the centre (== f(cen))
+    cen  : peak position (cm⁻¹)
+    wid  : half-width-at-half-maximum (HWHM); FWHM = 2*wid
+
+    The integrated area under the curve is  π * amp * wid.
+    """
     return amp * (wid**2) / ((x - cen)**2 + wid**2)
 
 def multi_lorentzian(x, *params):
+    """Sum of N Lorentzians; `params` is flat: [amp1,cen1,wid1, amp2,cen2,wid2, ...].
+
+    This signature (positional *params) is what `scipy.optimize.curve_fit`
+    expects: it passes the fit vector back as individual arguments.
+    """
     y = np.zeros_like(x)
     for i in range(0, len(params), 3):
         y += lorentzian(x, params[i], params[i+1], params[i+2])
     return y
 
+# ---------------------------------------------------------------------
+# IR group-frequency lookup
+# ---------------------------------------------------------------------
+# Maps a wavenumber (cm⁻¹) to a likely functional-group assignment and
+# the spectroscopic symbol for the mode type:
+#     ν (nu)   = stretching
+#     δ (delta)= bending / scissoring
+#     γ (gamma)= out-of-plane bending
+# Ranges are the standard textbook IR correlation tables. Used purely
+# for *labelling* the fitted peaks — it does not influence the fit.
 def get_ir_assignment_data(wn):
     wn = float(wn)
     if 3600 <= wn <= 3700: return "O-H $_{free}$", r"$\nu$"
@@ -68,21 +152,44 @@ def get_ir_assignment_data(wn):
     else: return "Peak", ""
 
 def get_full_assignment(wn):
+    """Long form, e.g. 'C=O (ν)' — used in the results table."""
     group, sym = get_ir_assignment_data(wn)
     if group == "Peak": return "Unknown"
     return f"{group} ({sym})".strip()
 
 def get_short_label(wn):
+    """Compact form, e.g. '1730 (ν C=O)' — used on the plot itself."""
     group, sym = get_ir_assignment_data(wn)
     if group == "Peak": return f"{wn:.0f}"
     return f"{wn:.0f} ({sym} {group})"
 
+# =====================================================================
+# MAIN APPLICATION CLASS
+# =====================================================================
 class IRDeconvolutionApp:
+    """The whole Tk application — UI, state, and analysis pipeline.
+
+    State machine summary (also reflected by the `stage` argument to
+    `plot_current_state`):
+
+        stage 1 :  spectrum + detected-peak markers (× crosses)
+        stage 2 :  + initial multi-Lorentzian guess (green dashed)
+        stage 3 :  + fitted curve, per-peak fills, smart labels
+
+    Persistent state lives on `self` so that any UI callback can
+    re-plot the latest view without re-running upstream computations.
+    """
+
     def __init__(self, root):
+        # `root` is the Tk root window passed in from `__main__`.
         self.root = root
         self.root.title("AjTeeranan IR Peak Analyzer V.2.01.Y2026")
         
-        # --- 1. STARTUP SEQUENCE ---
+        # --- 1. STARTUP SEQUENCE ---------------------------------------
+        # Open at 75% of the screen, centred. Then briefly maximise and
+        # un-maximise — this "zoom dance" forces Tk to recompute widget
+        # sizes correctly on multi-monitor / high-DPI setups, otherwise
+        # the layout can come up cramped on the first frame.
         self.root.update_idletasks()
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
@@ -92,7 +199,7 @@ class IRDeconvolutionApp:
         pos_y = (screen_h - target_h) // 2
         self.geometry_75 = f"{target_w}x{target_h}+{pos_x}+{pos_y}"
         self.root.geometry(self.geometry_75)
-        
+
         def perform_startup_dance():
             self.root.state('zoomed')
             self.root.update()
@@ -142,17 +249,28 @@ class IRDeconvolutionApp:
             'mathtext.fontset': 'cm'
         })
 
-        # --- DATA STATE ---
-        self.x_raw = None; self.y_raw = None     
+        # --- DATA STATE ------------------------------------------------
+        # Two parallel concepts:
+        #   *_raw   : the spectrum as pasted, never mutated by filters.
+        #   *_data  : current working view (range-clipped, optionally
+        #             baseline-shifted or %T→Abs converted).
+        # Resetting filters always rebuilds *_data from *_raw.
+        self.x_raw = None; self.y_raw = None
         self.x_data = None; self.y_data = None
-        self.y_abs_calc = None 
-        self.is_absorbance = False 
-        
-        self.manual_peaks = []      
-        self.excluded_peaks = []    
-        self.detected_peaks = []    
-        self.initial_params = []  
-        self.fitted_params = []   
+        self.y_abs_calc = None          # cached %T → absorbance conversion
+        self.is_absorbance = False      # True after the %T→ABS button
+
+        # Peak bookkeeping:
+        #   manual_peaks   : centres added by left-click on the plot.
+        #   excluded_peaks : centres removed by right-click / DELETE.
+        #   detected_peaks : the union shown on screen on each redraw.
+        self.manual_peaks = []
+        self.excluded_peaks = []
+        self.detected_peaks = []
+
+        # Fit parameters (flat triples: amp, cen, wid, amp, cen, wid, ...)
+        self.initial_params = []     # populated by GENERATE MODEL
+        self.fitted_params = []      # populated by START FITTING
         
         self.show_labels_var = tk.BooleanVar(value=True)
         self.snap_to_max_var = tk.BooleanVar(value=False)
@@ -413,6 +531,13 @@ class IRDeconvolutionApp:
         if self.var_auto_y.get(): self.apply_y_range()
 
     def paste_data(self, event=None):
+        """Parse the clipboard as a two-column spectrum and load it.
+
+        Accepts tab- *or* whitespace-separated data, ignores blank/non-
+        numeric lines silently (so headers copied from Excel are skipped).
+        Data is sorted by wavenumber so that downstream slicing with
+        ``self.x_data >= w_min`` etc. behaves predictably.
+        """
         try:
             self.root.update()
             try: clipboard = self.root.clipboard_get()
@@ -420,12 +545,17 @@ class IRDeconvolutionApp:
             rows = clipboard.strip().split('\n')
             wn_list = []; int_list = []
             for row in rows:
+                # Normalise tabs → spaces, then split on any whitespace.
                 p = row.replace('\t', ' ').split()
-                if len(p) >= 2: 
+                if len(p) >= 2:
+                    # Non-numeric rows (headers, units) raise ValueError
+                    # and are silently skipped.
                     try: wn_list.append(float(p[0])); int_list.append(float(p[1]))
                     except: continue
             if not wn_list: return
             x_arr = np.array(wn_list); y_arr = np.array(int_list)
+            # Sort by wavenumber ascending. (The *display* still uses an
+            # inverted x-axis — see `plot_current_state`.)
             idx = np.argsort(x_arr)
             self.x_raw = x_arr[idx]; self.y_raw = y_arr[idx]
             self.y_abs_calc = None 
@@ -440,6 +570,14 @@ class IRDeconvolutionApp:
         except Exception as e: messagebox.showerror("Paste Error", str(e))
 
     def convert_to_absorbance(self):
+        """Convert %T → Absorbance via Beer–Lambert:  A = 2 − log10(%T).
+
+        The constant 2 here is `log10(100)`, so the formula assumes the
+        input is in *percent* (0–100), not fractional (0–1). Any non-
+        positive transmittance is clamped to 0.0001 to keep `log10`
+        well-defined (a real spectrometer will never produce true zero,
+        but baseline-subtracted data can dip negative numerically).
+        """
         if self.y_raw is None: return
         try:
             y_safe = np.where(self.y_raw <= 0, 0.0001, self.y_raw)
@@ -454,6 +592,14 @@ class IRDeconvolutionApp:
         except: pass
 
     def baseline_correction(self):
+        """Zero the baseline by subtracting the global minimum of y_data.
+
+        Note: this is a flat-shift correction, not a sloped/polynomial
+        baseline. It is appropriate when the data has already been
+        atmosphere-corrected by the instrument and only a constant
+        offset remains. For drifting baselines, fit the baseline first
+        in your acquisition software.
+        """
         if self.y_data is None: return
         self.y_data = self.y_data - np.min(self.y_data)
         self.apply_range_filter()
@@ -526,11 +672,24 @@ class IRDeconvolutionApp:
         if not found_manual: self.excluded_peaks.append(wn)
 
     def on_click(self, event):
-        if len(self.fitted_params) > 0: return 
+        """Mouse interaction on the matplotlib canvas.
+
+        Left-click  → add a manual peak at the cursor.
+                      If "SNAP" is on, the peak is snapped to the largest
+                      data point within ±20 samples of the click.
+        Right-click → remove the nearest peak (manual or auto).
+
+        Clicks are ignored once a fit has been produced (`fitted_params`
+        non-empty) so the user cannot silently invalidate displayed
+        results — clear the fit first via RESET.
+        """
+        if len(self.fitted_params) > 0: return
         if event.inaxes != self.ax: return
-        if event.button == 1: 
+        if event.button == 1:
             x_click = event.xdata
             if self.snap_to_max_var.get() and self.x_data is not None:
+                # Find the data sample closest to the click, then search
+                # a ±20-sample window around it for the local maximum.
                 idx_nearest = (np.abs(self.x_data - x_click)).argmin()
                 window = 20
                 start = max(0, idx_nearest - window)
@@ -547,7 +706,22 @@ class IRDeconvolutionApp:
         self.manual_peaks = []; self.excluded_peaks = []; self.fitted_params = []
         self.step1_detect_peaks()
 
+    # =================================================================
+    # ANALYSIS PIPELINE — stages 1 → 2 → 3
+    # =================================================================
+
     def step1_detect_peaks(self):
+        """Stage 1 — auto-detect peaks and merge with the user's manual list.
+
+        SciPy's `find_peaks` is gated by two user-tuned thresholds:
+            min_height : absolute y-axis floor for a peak to count.
+            prominence : how much a peak must rise above neighbouring
+                         baseline before it is considered "real" — this
+                         is the key knob for suppressing noise spikes.
+
+        Auto-peaks within ±10 cm⁻¹ of anything in `excluded_peaks` are
+        dropped; remaining auto peaks are unioned with `manual_peaks`.
+        """
         if self.x_data is None: return
         auto_idxs, _ = find_peaks(self.y_data, height=self.min_height.get(), prominence=self.prominence.get())
         auto_peaks = list(self.x_data[auto_idxs])
@@ -555,6 +729,9 @@ class IRDeconvolutionApp:
         for ap in auto_peaks:
             is_excluded = False
             for ex in self.excluded_peaks:
+                # 10 cm⁻¹ tolerance: more generous than typical FTIR
+                # resolution (~2-4 cm⁻¹), so the exclusion is robust to
+                # small re-detection drift when thresholds change.
                 if abs(ap - ex) < 10.0: is_excluded = True; break
             if not is_excluded: valid_auto.append(ap)
         self.detected_peaks = sorted(list(set(valid_auto + self.manual_peaks)))
@@ -562,6 +739,17 @@ class IRDeconvolutionApp:
         self.plot_current_state(stage=1)
 
     def step2_initial_guess(self):
+        """Stage 2 — seed Lorentzian parameters from the detected peaks.
+
+        For each detected peak we build the triple (amp, cen, wid):
+            amp = the observed y-value at that x      (height)
+            cen = the observed x                      (centre)
+            wid = 10.0 cm⁻¹                           (FWHM ≈ 20 cm⁻¹)
+
+        10 is a deliberately generic starting width — wide enough to
+        cover most real IR bands but narrow enough that overlapping
+        peaks separate during optimisation. `curve_fit` adjusts it.
+        """
         if not self.detected_peaks: return
         self.initial_params = []
         for cen in self.detected_peaks:
@@ -571,6 +759,18 @@ class IRDeconvolutionApp:
         self.plot_current_state(stage=2)
 
     def step3_optimize(self):
+        """Stage 3 — non-linear least squares fit of the multi-Lorentzian.
+
+        Uses Levenberg–Marquardt via `scipy.optimize.curve_fit` with up
+        to 15 000 function evaluations (`maxfev`) — enough headroom for
+        spectra with many overlapping bands. The fit quality is reported
+        as the coefficient of determination:
+
+            R² = 1 − Σ(y − ŷ)² / Σ(y − ȳ)²
+
+        For each fitted peak we display height, width, and integrated
+        area  A_int = π · amp · wid  in the results table.
+        """
         if not self.initial_params: return
         try:
             popt, _ = curve_fit(multi_lorentzian, self.x_data, self.y_data, p0=self.initial_params, maxfev=15000)
@@ -582,7 +782,12 @@ class IRDeconvolutionApp:
             self.fit_stats_var.set(f"GOODNESS OF FITTING: R² = {r2:.4f}")
             self.tree.delete(*self.tree.get_children())
             for i in range(0, len(popt), 3):
+                # `wid` can come back negative from the optimiser because
+                # the Lorentzian model is symmetric in wid (wid² in the
+                # numerator and denominator). Take |wid| so the reported
+                # width is physical.
                 amp, cen, wid = popt[i], popt[i+1], abs(popt[i+2])
+                # Closed-form integral of a Lorentzian:  ∫ L dx = π·amp·wid
                 area = amp * wid * np.pi
                 self.tree.insert("", tk.END, values=(f"{cen:.1f}", get_full_assignment(cen), f"{amp:.3f}", f"{wid:.3f}", f"{area:.3f}"))
             self.plot_current_state(stage=3)
@@ -592,7 +797,20 @@ class IRDeconvolutionApp:
         self.label_jitter = random.uniform(0, 100)
         self.plot_current_state(3)
 
+    # =================================================================
+    # PLOTTING — single entry point, drives the matplotlib canvas
+    # =================================================================
     def plot_current_state(self, stage=1):
+        """Redraw the whole plot from current state.
+
+        `stage` controls what is overlaid on top of the spectrum:
+            1 : detected-peak markers only      (after detection)
+            2 : initial guess curve (green --)  (after generate model)
+            3 : fit, per-peak fills, smart labels (after fitting)
+
+        IR convention: the x-axis is *inverted* (high wavenumber on the
+        left). This is handled by always setting xlim as (max, min).
+        """
         self.ax.clear()
         fs_graph = self.graph_font_size.get()
         fs_label = self.label_font_size.get()
@@ -657,16 +875,31 @@ class IRDeconvolutionApp:
                     self.ax.fill_between(self.x_data, lorentzian(self.x_data, amp, cen, wid), alpha=0.3, color=p_data['color'])
 
                 if self.show_labels_var.get():
+                    # ---- Smart non-overlapping peak labels --------------
+                    # Each label is drawn at (x_text, text_y_base) and
+                    # connected back to its peak by a 3-segment leader
+                    # line (vertical-from-peak, horizontal, vertical-to-
+                    # label) — the "knee" at `knee_y_base`.
+                    #
+                    # x_text starts at the true peak centre then gets
+                    # spread out by a simple greedy sweep so no two
+                    # labels are closer than `min_dist` cm⁻¹. Five
+                    # passes is empirically enough to settle even
+                    # densely packed spectra.
                     visible_peaks.sort(key=lambda x: x['cen'])
                     curr_ymin, curr_ymax = self.ax.get_ylim()
                     total_view_h = curr_ymax - curr_ymin
                     knee_y_base = curr_ymin + (total_view_h * knee_r)
                     text_y_base = curr_ymin + (total_view_h * text_r)
-                    spacing_offset = total_view_h * 0.005 
+                    spacing_offset = total_view_h * 0.005
 
+                    # Minimum allowed horizontal gap between labels,
+                    # expressed as a fraction of the visible x-range.
                     min_dist = (view_max - view_min) * space_val
                     for p in visible_peaks: p['x_text'] = p['cen']
                     for _ in range(5):
+                        # Greedy left→right pass: push each label far
+                        # enough right of its predecessor.
                         for i in range(len(visible_peaks)-1):
                             curr = visible_peaks[i]['x_text']
                             next_val = visible_peaks[i+1]['x_text']
@@ -675,6 +908,8 @@ class IRDeconvolutionApp:
                                 
                     for i, p in enumerate(visible_peaks):
                         x_peak = p['cen']; y_peak = p['y_peak']; x_text = p['x_text']
+                        # Stagger the knee heights across 3 rows (i % 3)
+                        # so adjacent leader lines don't overlap.
                         knee_y = knee_y_base + (i%3)*(total_view_h * 0.02)
                         line_end_y = text_y_base
                         text_draw_y = text_y_base + spacing_offset
@@ -707,10 +942,23 @@ class IRDeconvolutionApp:
         if f: self.fig.savefig(f, dpi=300, bbox_inches='tight')
 
     def copy_graph_clipboard(self):
+        """Put the current figure on the Windows clipboard as a bitmap.
+
+        Pipeline:
+            matplotlib → PNG (in-memory) → PIL → BMP (in-memory)
+            → strip 14-byte BITMAPFILEHEADER → CF_DIB payload
+            → GlobalAlloc + SetClipboardData
+
+        The 14-byte slice is required because Windows' CF_DIB format
+        expects the bitmap starting at BITMAPINFOHEADER — the file-
+        header that PIL writes at the start of a .BMP must be removed.
+        """
         try:
             buf = BytesIO(); self.fig.savefig(buf, format='png', dpi=300, bbox_inches='tight')
             buf.seek(0); img = Image.open(buf)
             output = BytesIO(); img.convert("RGB").save(output, "BMP")
+            # Slice [14:] drops the 14-byte BITMAPFILEHEADER; CF_DIB
+            # starts at the BITMAPINFOHEADER.
             data = output.getvalue()[14:]; output.close()
             if user32.OpenClipboard(0):
                 try:
@@ -726,7 +974,13 @@ class IRDeconvolutionApp:
             else: messagebox.showerror("Error", "Clipboard busy")
         except Exception as e: messagebox.showinfo("Info", f"Copy failed: {e}")
 
+# =====================================================================
+# ENTRY POINT
+# =====================================================================
 if __name__ == "__main__":
+    # Standard Tk boot: create the root window, instantiate the app
+    # (which builds all widgets and binds events), then hand control
+    # to Tk's event loop.
     root = tk.Tk()
     app = IRDeconvolutionApp(root)
     root.mainloop()

@@ -1,0 +1,70 @@
+FTIR Peak Analyzer — Non-Commercial Use License
+================================================
+
+Author:        Teeranan Nongnual
+Affiliation:   Department of Chemistry, Faculty of Science,
+               Burapha University, Thailand
+Funding:       Developed under a research grant from
+               Burapha University (BUU) and
+               Thailand Science Research and Innovation (TSRI).
+
+This software is shared as a research/educational tool. The author does
+not claim restrictive copyright ownership over the ideas, methods, or
+algorithms expressed here; the code is released for the community to
+use, study, modify, and share, subject only to the conditions below.
+
+
+1. PERMITTED USE
+----------------
+You are free to:
+  (a) Use this software for personal, academic, research, teaching, and
+      any other non-commercial purpose.
+  (b) Study how the software works and inspect its source code.
+  (c) Modify, adapt, or extend the software.
+  (d) Redistribute the original or modified versions, in source or
+      compiled form, to other non-commercial users.
+
+No fee, registration, or permission request is required for the above.
+
+
+2. NON-COMMERCIAL CONDITION
+---------------------------
+Commercial use is NOT permitted without prior written consent from the
+author. "Commercial use" includes, but is not limited to:
+  - Selling the software, or selling access to it (SaaS, hosting, etc.).
+  - Bundling it with, or embedding it in, a product or service that is
+    sold or licensed for a fee.
+  - Using it as part of a paid consulting deliverable to a third party.
+
+Use of the software inside a company solely for the company's own
+internal, non-revenue-generating research is permitted and is NOT
+considered commercial use under this license.
+
+
+3. ATTRIBUTION
+--------------
+If you use, modify, or redistribute this software (including in
+academic publications, presentations, or derived software), please:
+  (a) Keep this LICENSE file and the author/affiliation header intact.
+  (b) Acknowledge the original author and the funding sources:
+        "FTIR Peak Analyzer by Teeranan Nongnual,
+         Department of Chemistry, Faculty of Science,
+         Burapha University, Thailand. Supported by a research grant
+         from Burapha University and Thailand Science Research and
+         Innovation (TSRI)."
+
+
+4. NO WARRANTY
+--------------
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT.
+IN NO EVENT SHALL THE AUTHOR OR FUNDING ORGANISATIONS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+5. CONTACT FOR COMMERCIAL LICENSING
+-----------------------------------
+For commercial use, please contact the author through Burapha University
+to arrange a separate written agreement.
